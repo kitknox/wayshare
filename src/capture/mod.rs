@@ -17,7 +17,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
-use wayland_client::protocol::{wl_buffer::WlBuffer, wl_output, wl_registry};
+use wayland_client::protocol::{
+    wl_buffer::WlBuffer,
+    wl_output, wl_registry,
+    wl_shm::{self, WlShm},
+    wl_shm_pool::WlShmPool,
+};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::ext::image_capture_source::v1::client::{
     ext_image_capture_source_v1::ExtImageCaptureSourceV1,
@@ -80,9 +85,16 @@ pub struct DmabufBuffer {
     wl_buffer: WlBuffer,
     mapping: std::sync::OnceLock<Mapping>,
     gbm: Option<alloc::GbmBuffer>,
+    /// A wl_shm memfd, which needs no DMA_BUF sync.
+    shm: bool,
 }
 
 impl DmabufBuffer {
+    /// Whether this is wl_shm memory rather than a dmabuf.
+    pub fn is_shm(&self) -> bool {
+        self.shm
+    }
+
     /// Consumes BGRX pixels while mapped. GBM detiles nonlinear buffers for the callback.
     pub fn with_read<T>(&self, read: impl FnOnce(&ReadGuard<'_>) -> T) -> Result<T> {
         validate_cpu_format(self.fourcc)?;
@@ -103,7 +115,8 @@ impl DmabufBuffer {
                 self.mapping.get_or_init(|| m)
             }
         };
-        let guard = ReadGuard::new(map, &p.fd, p.offset as usize, p.stride as usize)?;
+        let fd = (!self.shm).then_some(&p.fd);
+        let guard = ReadGuard::new(map, fd, p.offset as usize, p.stride as usize)?;
         Ok(read(&guard))
     }
 }
@@ -301,6 +314,8 @@ struct Constraints {
     fourcc: u32,
     /// The compositor's offers. An empty list or INVALID alone allows implicit allocation.
     modifiers: Vec<u64>,
+    /// Capture into wl_shm instead of a dmabuf.
+    shm: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -377,6 +392,8 @@ struct State {
     ext_mgr: Option<ExtImageCopyCaptureManagerV1>,
     ext_src_mgr: Option<ExtOutputImageCaptureSourceManagerV1>,
     wlr_mgr: Option<ZwlrScreencopyManagerV1>,
+    shm: Option<WlShm>,
+    pending_shm: Vec<wl_shm::Format>,
     ext: Option<(ExtImageCaptureSourceV1, ExtImageCopyCaptureSessionV1)>,
 
     /// Constraints being collected from session events until `done`.
@@ -417,6 +434,8 @@ impl State {
             ext_mgr: globals.bind(qh, 1..=1, ()).ok(),
             ext_src_mgr: globals.bind(qh, 1..=1, ()).ok(),
             wlr_mgr: globals.bind(qh, 3..=3, ()).ok(),
+            shm: globals.bind(qh, 1..=1, ()).ok(),
+            pending_shm: Vec::new(),
             ext: None,
             pending: Vec::new(),
             pending_size: (0, 0),
@@ -445,6 +464,37 @@ impl State {
             bail!("all {MAX_BUFFERS} capture buffers are still held by consumers");
         }
         let c = self.constraints.as_ref().context("no buffer constraints")?;
+        if c.shm {
+            let alloc = Allocator::allocate_shm(c.width, c.height)?;
+            let p = &alloc.planes[0];
+            let size = (p.stride * c.height) as i32;
+            let shm = self.shm.as_ref().context("wl_shm")?;
+            let pool = shm.create_pool(p.fd.as_fd(), size, qh, ());
+            let wl_buffer = pool.create_buffer(
+                0,
+                c.width as i32,
+                c.height as i32,
+                p.stride as i32,
+                wl_shm::Format::Xrgb8888,
+                qh,
+                (),
+            );
+            pool.destroy();
+            let buf = Arc::new(DmabufBuffer {
+                id: alloc.id,
+                width: c.width,
+                height: c.height,
+                fourcc: c.fourcc,
+                modifier: alloc.modifier,
+                planes: alloc.planes,
+                wl_buffer,
+                mapping: Default::default(),
+                shm: true,
+                gbm: alloc.gbm,
+            });
+            self.pool.push(buf.clone());
+            return Ok(buf);
+        }
         let alloc = self
             .alloc
             .allocate(c.width, c.height, c.fourcc, &c.modifiers)?;
@@ -492,6 +542,7 @@ impl State {
             gbm: alloc.gbm,
             wl_buffer,
             mapping: Default::default(),
+            shm: false,
         });
         self.pool.push(buf.clone());
         Ok(buf)
@@ -618,6 +669,9 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
             ext_session::Event::DmabufDevice { device } => {
                 state.pending_device = device.try_into().ok().map(u64::from_ne_bytes);
             }
+            ext_session::Event::ShmFormat {
+                format: WEnum::Value(f),
+            } => state.pending_shm.push(f),
             ext_session::Event::DmabufFormat { format, modifiers } => {
                 let mods = modifiers
                     .as_chunks::<8>()
@@ -629,6 +683,26 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
             }
             ext_session::Event::Done => {
                 let formats = std::mem::take(&mut state.pending);
+                let shm_formats = std::mem::take(&mut state.pending_shm);
+                if state.shm.is_some()
+                    && state.alloc.is_virtio_gpu()
+                    && shm_formats.contains(&wl_shm::Format::Xrgb8888)
+                {
+                    let (width, height) = state.pending_size;
+                    tracing::debug!(
+                        width,
+                        height,
+                        "ext capture constraints: wl_shm on virtio-gpu"
+                    );
+                    state.set_constraints(Constraints {
+                        width,
+                        height,
+                        fourcc: PREFERRED_FORMATS[0],
+                        modifiers: Vec::new(),
+                        shm: true,
+                    });
+                    return;
+                }
                 let picked = select_format(&formats, state.alloc.memory);
                 let Some((fourcc, modifiers)) = picked.cloned() else {
                     tracing::error!(
@@ -656,6 +730,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
                     height,
                     fourcc,
                     modifiers,
+                    shm: false,
                 });
             }
             ext_session::Event::Stopped => state.stopped = true,
@@ -751,6 +826,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     height,
                     fourcc,
                     modifiers,
+                    shm: false,
                 });
                 match state.take_buffer(qh) {
                     Ok(buffer) => {
@@ -847,6 +923,8 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
 }
 delegate_noop!(State: ignore ZwpLinuxBufferParamsV1);
 delegate_noop!(State: ignore WlBuffer);
+delegate_noop!(State: ignore WlShm);
+delegate_noop!(State: WlShmPool);
 delegate_noop!(State: ExtImageCopyCaptureManagerV1);
 delegate_noop!(State: ExtOutputImageCaptureSourceManagerV1);
 delegate_noop!(State: ExtImageCaptureSourceV1);

@@ -124,6 +124,44 @@ impl Allocator {
         })
     }
 
+    /// virtio-gpu (virgl) leaves captured dmabufs empty, so capture goes through wl_shm.
+    pub fn is_virtio_gpu(&self) -> bool {
+        is_virtio_gpu(&self.node)
+    }
+
+    /// Single-plane 32 bpp memfd for a wl_shm buffer.
+    pub fn allocate_shm(width: u32, height: u32) -> Result<Allocation> {
+        // wl_shm pool size and buffer dimensions are signed 32-bit protocol fields.
+        let pixels = u64::from(width) * u64::from(height);
+        if width == 0 || height == 0 || pixels > i32::MAX as u64 / 4 {
+            bail!("invalid wl_shm buffer size {width}x{height}");
+        }
+        let size = pixels * 4;
+        let stride = width * 4;
+        // SAFETY: the fd is checked before `OwnedFd` takes sole ownership.
+        let fd = unsafe {
+            let fd = libc::memfd_create(c"wayshare-shm".as_ptr(), libc::MFD_CLOEXEC);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error()).context("memfd_create");
+            }
+            OwnedFd::from_raw_fd(fd)
+        };
+        // SAFETY: `fd` is a live memfd owned above.
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("size shm memfd");
+        }
+        Ok(Allocation {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            modifier: MOD_LINEAR,
+            gbm: None,
+            planes: vec![Plane {
+                fd,
+                offset: 0,
+                stride,
+            }],
+        })
+    }
+
     pub fn render_node(&self) -> &PathBuf {
         &self.node
     }
@@ -264,6 +302,16 @@ impl Allocator {
     }
 }
 
+/// Red Hat virtio-gpu.
+fn is_virtio_gpu(node: &Path) -> bool {
+    let Some(name) = node.file_name() else {
+        return false;
+    };
+    let dev = Path::new("/sys/class/drm").join(name).join("device");
+    let read = |f: &str| std::fs::read_to_string(dev.join(f)).unwrap_or_default();
+    read("vendor").trim() == "0x1af4" && read("device").trim() == "0x1050"
+}
+
 fn render_node_for(dev: u64) -> Result<PathBuf> {
     for entry in std::fs::read_dir("/dev/dri")? {
         let path = entry?.path();
@@ -293,6 +341,19 @@ mod tests {
     use super::*;
 
     const TILED: u64 = 0x0100_0000_0000_0001;
+
+    #[test]
+    fn shm_allocation_rejects_invalid_protocol_sizes() {
+        for (width, height) in [
+            (0, 1),
+            (1, 0),
+            (u32::MAX, 1),
+            (1, u32::MAX),
+            (u32::MAX, u32::MAX),
+        ] {
+            assert!(Allocator::allocate_shm(width, height).is_err());
+        }
+    }
 
     #[test]
     fn invalid_and_empty_modifiers_use_implicit_allocation() {

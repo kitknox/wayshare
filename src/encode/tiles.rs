@@ -180,7 +180,8 @@ impl<B: Backend> Tiles<B> {
             (Some(c), _) => (0..TILE_COUNT)
                 .filter(|&t| c[t])
                 .fold(0u8, |m, t| m | 1 << t),
-            (None, Some(d)) => match d.diff(b) {
+            // The GPU differ imports dmabufs; wl_shm frames use compositor damage.
+            (None, Some(d)) if !b.is_shm() => match d.diff(b) {
                 Ok(c) => (0..TILE_COUNT)
                     .filter(|&t| c[t])
                     .fold(0u8, |m, t| m | 1 << t),
@@ -190,7 +191,7 @@ impl<B: Backend> Tiles<B> {
                     self.layout.tiles_touched(&frame.damage)
                 }
             },
-            (None, None) => self.layout.tiles_touched(&frame.damage),
+            _ => self.layout.tiles_touched(&frame.damage),
         };
         timings.diff = t0.elapsed();
         if let Some(bps) = self.rate.take_due()
